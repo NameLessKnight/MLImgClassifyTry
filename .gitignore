@@ -1,0 +1,53 @@
+# 忽略 Python 缓存和虚拟环境
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pdb
+*.egg-info/
+.env/
+.venv/
+env/
+venv/
+
+# 忽略 Jupyter Notebook 检查点
+.ipynb_checkpoints/
+
+# 忽略数据集中的图片，但保留任意层级的 .gitkeep
+dataset/**/*.jpg
+dataset/**/*.jpeg
+dataset/**/*.png
+dataset/**/*.gif
+dataset/**/*.webp
+!dataset/**/.gitkeep
+
+# 忽略 sorted_images 中的图片，但保留 .gitkeep
+sorted_images/**/*.jpg
+sorted_images/**/*.jpeg
+sorted_images/**/*.png
+sorted_images/**/*.gif
+sorted_images/**/*.webp
+!sorted_images/**/.gitkeep
+
+# 忽略 unsorted_images 中的图片，但保留 .gitkeep
+unsorted_images/**/*.jpg
+unsorted_images/**/*.jpeg
+unsorted_images/**/*.png
+unsorted_images/**/*.gif
+unsorted_images/**/*.webp
+!unsorted_images/**/.gitkeep
+
+# 忽略日志和输出文件
+*.log
+*.out
+
+# 忽略操作系统生成的文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 忽略 VS Code 配置
+.vscode/
+
+# 保留空文件夹用
