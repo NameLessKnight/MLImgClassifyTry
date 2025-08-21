@@ -53,20 +53,97 @@ model.fc = nn.Sequential(
 )
 model = model.to(device)
 
-# 冻结卷积层，只微调 layer4 和 fc
-for param in model.parameters():
-    param.requires_grad = False
-for param in model.layer4.parameters():
-    param.requires_grad = True
-for param in model.fc.parameters():
-    param.requires_grad = True
+# Checkpoint: try to load if exists (continue training); failure won't crash.
+checkpoint_path = "best_classifier.pth"
+if os.path.exists(checkpoint_path):
+    try:
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        print(f"Loaded checkpoint '{checkpoint_path}'. Will continue training from it.")
+    except Exception as e:
+        print(f"Warning: failed to load checkpoint '{checkpoint_path}': {e}. Starting fresh.")
+else:
+    print(f"Checkpoint '{checkpoint_path}' not found. Training from scratch.")
+
+# ---- 分阶段训练配置 ----
+# 默认策略：先训练 head（fc）若干 epoch，再解冻 layer4 并微调，再可选全量微调
+head_epochs = 2
+layer4_epochs = 5
+# full_epochs 为剩余 epoch（如果为 0，则不执行全量微调）
+full_epochs = max(0, num_epochs - head_epochs - layer4_epochs)
+
+def set_bn_eval(m):
+    """Set all BatchNorm layers to eval mode (disable running stats update)."""
+    for module in m.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+def set_trainable(model, train_fc=False, train_layer4=False, train_all=False):
+    """Set requires_grad for model parts according to phase."""
+    if train_all:
+        for p in model.parameters():
+            p.requires_grad = True
+        return
+
+    # default: freeze all
+    for p in model.parameters():
+        p.requires_grad = False
+    if train_layer4:
+        for p in model.layer4.parameters():
+            p.requires_grad = True
+    if train_fc:
+        for p in model.fc.parameters():
+            p.requires_grad = True
+
+def count_trainable_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def make_optimizer(model, base_lr, weight_decay=1e-4):
+    """Create optimizer with sensible param groups: fc, layer4, others(if trainable)."""
+    fc_params = [p for p in model.fc.parameters() if p.requires_grad]
+    layer4_params = [p for p in model.layer4.parameters() if p.requires_grad]
+    other_params = [p for n, p in model.named_parameters() if p.requires_grad and ("fc." not in n and "layer4." not in n)]
+
+    param_groups = []
+    if fc_params:
+        param_groups.append({'params': fc_params, 'lr': base_lr})
+    if layer4_params:
+        param_groups.append({'params': layer4_params, 'lr': base_lr * 0.1})
+    if other_params:
+        # smaller lr for other pretrained layers if they are trainable
+        param_groups.append({'params': other_params, 'lr': base_lr * 0.01})
+
+    if not param_groups:
+        # fallback: no trainable params -> optimizer on all params (safe guard)
+        return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+    return optim.Adam(param_groups, lr=base_lr, weight_decay=weight_decay)
+
+# 初始化：确定 epoch 0 的 phase 并创建 optimizer
+def get_phase_for_epoch(ep):
+    if ep < head_epochs:
+        return 'head'
+    if ep < head_epochs + layer4_epochs:
+        return 'layer4'
+    return 'full'
+
+current_phase = get_phase_for_epoch(0)
+if current_phase == 'head':
+    set_trainable(model, train_fc=True, train_layer4=False, train_all=False)
+    # 对少量可训练参数时，通常将 BN 设为 eval 防止 running stats 被噪声破坏
+    set_bn_eval(model)
+elif current_phase == 'layer4':
+    set_trainable(model, train_fc=True, train_layer4=True, train_all=False)
+    set_bn_eval(model)
+else:
+    set_trainable(model, train_all=True)
+
+print(f"Starting epoch 0 in phase '{current_phase}', trainable params: {count_trainable_params(model)}")
+optimizer = make_optimizer(model, learning_rate, weight_decay=weight_decay)
 
 # ---------------------------
-# 损失函数 & 优化器
+# 损失函数
 # ---------------------------
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), 
-                       lr=learning_rate, weight_decay=weight_decay)
 
 # ---------------------------
 # 训练循环 + 验证集评估 + Top-3 + 保存最佳模型
@@ -74,7 +151,30 @@ optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
 best_val_acc = 0.0
 
 for epoch in range(num_epochs):
+    # 每个 epoch 开始时检查阶段是否变化；若变化则更新可训练参数并重建 optimizer，保存阶段快照
+    new_phase = get_phase_for_epoch(epoch)
+    if new_phase != current_phase:
+        current_phase = new_phase
+        if current_phase == 'head':
+            set_trainable(model, train_fc=True, train_layer4=False, train_all=False)
+        elif current_phase == 'layer4':
+            set_trainable(model, train_fc=True, train_layer4=True, train_all=False)
+        else:
+            set_trainable(model, train_all=True)
+
+        # 重建 optimizer（按照新的可训练参数分组）
+        optimizer = make_optimizer(model, learning_rate, weight_decay=weight_decay)
+        print(f"--- Phase changed to '{current_phase}' at epoch {epoch}. Trainable params: {count_trainable_params(model)} ---")
+        # 保存阶段开始的模型快照（便于回滚）
+        snapshot_path = f"phase_snapshot_{current_phase}_epoch{epoch}.pth"
+        torch.save(model.state_dict(), snapshot_path)
+        print(f"Saved phase snapshot: {snapshot_path}")
+
     model.train()
+    # 在 head 和 layer4 阶段通常不更新 BN 的 running stats
+    if current_phase in ('head', 'layer4'):
+        set_bn_eval(model)
+
     running_loss, correct, total = 0.0, 0, 0
     for batch_idx, (inputs, labels) in enumerate(train_loader):
         inputs, labels = inputs.to(device), labels.to(device)
