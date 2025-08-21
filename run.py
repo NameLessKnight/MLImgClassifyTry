@@ -22,7 +22,11 @@ val_transforms = transforms.Compose([
 classes = ['anime', 'camera', 'other']  # 按训练时类别填
 model = models.resnet18(weights=None)
 num_features = model.fc.in_features
-model.fc = torch.nn.Linear(num_features, len(classes))
+# Match training head: Dropout followed by Linear (keys were saved as fc.1.*)
+model.fc = torch.nn.Sequential(
+    torch.nn.Dropout(0.3),
+    torch.nn.Linear(num_features, len(classes))
+)
 model.load_state_dict(torch.load("best_classifier.pth", map_location=device))
 model = model.to(device)
 model.eval()

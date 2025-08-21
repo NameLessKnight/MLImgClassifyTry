@@ -1,3 +1,9 @@
+## Languages
+
+- [English](README.md)
+- [中文](README.zh.md)
+- [日本語](README.ja.md)
+
 ## プロジェクト概要
 
 これは PyTorch を使った小さな画像分類プロジェクトです。ResNet-18 を訓練して画像を分類し、未分類の画像を一括で整理できます。
