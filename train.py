@@ -53,16 +53,48 @@ model.fc = nn.Sequential(
 )
 model = model.to(device)
 
-# Checkpoint: try to load if exists (continue training); failure won't crash.
-checkpoint_path = "best_classifier.pth"
-if os.path.exists(checkpoint_path):
+# 检查点加载（恢复训练）
+def resume_from_checkpoint(path, model, device):
+        """
+        尝试从 checkpoint 恢复模型并返回 (loaded_epoch, loaded_optimizer_state)。
+
+        支持两种格式：
+        1) 完整 checkpoint（字典，包含 'epoch','model','optimizer'），这是推荐格式；
+        2) 旧的仅包含 model.state_dict() 的格式（兼容加载）。
+
+        如果加载失败，函数会打印警告并返回 (None, None)。
+
+        参数：
+            - path: checkpoint 文件路径
+            - model: 要加载权重的模型实例（会就地修改）
+            - device: 加载到的设备（cpu 或 cuda）
+
+        返回：
+            (loaded_epoch, loaded_optimizer_state) 或 (None, None)
+        """
+    if not os.path.exists(path):
+        print(f"Checkpoint '{path}' not found. Training from scratch.")
+        return None, None
+
     try:
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        print(f"Loaded checkpoint '{checkpoint_path}'. Will continue training from it.")
+        ckpt = torch.load(path, map_location=device)
+        if isinstance(ckpt, dict) and 'model' in ckpt:
+            model.load_state_dict(ckpt['model'])
+            loaded_optimizer = ckpt.get('optimizer', None)
+            loaded_epoch = ckpt.get('epoch', None)
+            print(f"Loaded full checkpoint '{path}' (epoch={loaded_epoch}).")
+            return loaded_epoch, loaded_optimizer
+        else:
+            model.load_state_dict(ckpt)
+            print(f"Loaded model state_dict from '{path}'.")
+            return None, None
     except Exception as e:
-        print(f"Warning: failed to load checkpoint '{checkpoint_path}': {e}. Starting fresh.")
-else:
-    print(f"Checkpoint '{checkpoint_path}' not found. Training from scratch.")
+        print(f"Warning: failed to load checkpoint '{path}': {e}. Starting fresh.")
+        return None, None
+
+
+checkpoint_path = "best_classifier.pth"
+loaded_epoch, loaded_optimizer_state = resume_from_checkpoint(checkpoint_path, model, device)
 
 # ---- 分阶段训练配置 ----
 # 默认策略：先训练 head（fc）若干 epoch，再解冻 layer4 并微调，再可选全量微调
@@ -72,21 +104,40 @@ layer4_epochs = 5
 full_epochs = max(0, num_epochs - head_epochs - layer4_epochs)
 
 def set_bn_eval(m):
-    """Set all BatchNorm layers to eval mode (disable running stats update)."""
+    """
+    将模型中的所有 BatchNorm 层切换到 eval 模式，停止更新 running mean/var。
+
+    为什么要这样做：在微调（只训练部分层）时，如果 batch size 很小，
+    更新 BN 的 running stats 会被噪声影响，导致性能不稳定。
+    所以在只训练 head 或少量层时，通常将 BN 固定为 eval。
+    """
     for module in m.modules():
         if isinstance(module, nn.modules.batchnorm._BatchNorm):
             module.eval()
 
 def set_trainable(model, train_fc=False, train_layer4=False, train_all=False):
-    """Set requires_grad for model parts according to phase."""
+    """
+    根据当前训练阶段设置哪些参数参与训练（即设置 requires_grad）。
+
+    参数说明：
+      - train_fc: 是否训练分类头（model.fc）
+      - train_layer4: 是否训练最后一组残差块（model.layer4）
+      - train_all: 是否训练全部参数
+
+    典型用法：
+      - 只训练 head： set_trainable(model, train_fc=True)
+      - 解冻 layer4： set_trainable(model, train_fc=True, train_layer4=True)
+      - 全量训练： set_trainable(model, train_all=True)
+    """
     if train_all:
         for p in model.parameters():
             p.requires_grad = True
         return
 
-    # default: freeze all
+    # 默认先冻结所有参数（不参与梯度计算）
     for p in model.parameters():
         p.requires_grad = False
+    # 根据标志有选择地解冻某些模块
     if train_layer4:
         for p in model.layer4.parameters():
             p.requires_grad = True
@@ -98,7 +149,16 @@ def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def make_optimizer(model, base_lr, weight_decay=1e-4):
-    """Create optimizer with sensible param groups: fc, layer4, others(if trainable)."""
+    """
+    根据当前哪些参数被设置为可训练，创建带有参数组（param groups）的优化器。
+
+    目的：对不同模块使用不同的学习率，例如：
+      - 新初始化的分类头（fc）使用 base_lr（较大）以快速学习；
+      - 微调的预训练层（layer4）使用较小的 lr（base_lr * 0.1）；
+      - 其他可训练的预训练层使用更小 lr（base_lr * 0.01）。
+
+    返回一个 Adam 优化器实例。
+    """
     fc_params = [p for p in model.fc.parameters() if p.requires_grad]
     layer4_params = [p for p in model.layer4.parameters() if p.requires_grad]
     other_params = [p for n, p in model.named_parameters() if p.requires_grad and ("fc." not in n and "layer4." not in n)]
@@ -109,27 +169,36 @@ def make_optimizer(model, base_lr, weight_decay=1e-4):
     if layer4_params:
         param_groups.append({'params': layer4_params, 'lr': base_lr * 0.1})
     if other_params:
-        # smaller lr for other pretrained layers if they are trainable
+        # 如果还有其他可训练的预训练层，给更小的 lr
         param_groups.append({'params': other_params, 'lr': base_lr * 0.01})
 
     if not param_groups:
-        # fallback: no trainable params -> optimizer on all params (safe guard)
+        # 兜底：没有可训练参数则将所有参数放入 optimizer（一般不会发生）
         return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 
     return optim.Adam(param_groups, lr=base_lr, weight_decay=weight_decay)
 
 # 初始化：确定 epoch 0 的 phase 并创建 optimizer
 def get_phase_for_epoch(ep):
+    """
+    根据 epoch 返回当前处于哪个训练阶段：'head'、'layer4' 或 'full'。
+    这个划分是基于 head_epochs 和 layer4_epochs 的累积。
+    """
     if ep < head_epochs:
         return 'head'
     if ep < head_epochs + layer4_epochs:
         return 'layer4'
     return 'full'
 
-current_phase = get_phase_for_epoch(0)
+# 根据是否加载了 checkpoint 决定从哪个 epoch 开始（start_epoch）
+start_epoch = 0
+if loaded_epoch is not None:
+    start_epoch = loaded_epoch + 1
+
+# 初始化 current_phase 与可训练参数，基于 start_epoch
+current_phase = get_phase_for_epoch(start_epoch)
 if current_phase == 'head':
     set_trainable(model, train_fc=True, train_layer4=False, train_all=False)
-    # 对少量可训练参数时，通常将 BN 设为 eval 防止 running stats 被噪声破坏
     set_bn_eval(model)
 elif current_phase == 'layer4':
     set_trainable(model, train_fc=True, train_layer4=True, train_all=False)
@@ -137,8 +206,18 @@ elif current_phase == 'layer4':
 else:
     set_trainable(model, train_all=True)
 
-print(f"Starting epoch 0 in phase '{current_phase}', trainable params: {count_trainable_params(model)}")
+# 创建 optimizer（基于当前可训练参数）并尝试恢复 optimizer state
 optimizer = make_optimizer(model, learning_rate, weight_decay=weight_decay)
+if loaded_optimizer_state is not None:
+    try:
+        optimizer.load_state_dict(loaded_optimizer_state)
+        print(f"Restored optimizer state from checkpoint; resuming from epoch {start_epoch}.")
+    except Exception as e:
+        print(f"Warning: failed to restore optimizer state: {e}. Continuing with fresh optimizer.")
+elif loaded_epoch is not None:
+    print(f"Resuming from epoch {start_epoch} (no optimizer state in checkpoint).")
+
+print(f"Starting epoch {start_epoch} in phase '{current_phase}', trainable params: {count_trainable_params(model)}")
 
 # ---------------------------
 # 损失函数
@@ -150,7 +229,7 @@ criterion = nn.CrossEntropyLoss()
 # ---------------------------
 best_val_acc = 0.0
 
-for epoch in range(num_epochs):
+for epoch in range(start_epoch, num_epochs):
     # 每个 epoch 开始时检查阶段是否变化；若变化则更新可训练参数并重建 optimizer，保存阶段快照
     new_phase = get_phase_for_epoch(epoch)
     if new_phase != current_phase:
@@ -167,8 +246,14 @@ for epoch in range(num_epochs):
         print(f"--- Phase changed to '{current_phase}' at epoch {epoch}. Trainable params: {count_trainable_params(model)} ---")
         # 保存阶段开始的模型快照（便于回滚）
         snapshot_path = f"phase_snapshot_{current_phase}_epoch{epoch}.pth"
-        torch.save(model.state_dict(), snapshot_path)
-        print(f"Saved phase snapshot: {snapshot_path}")
+        # 保存完整字典，包含 model + optimizer(state_dict) + epoch，便于完整恢复训练
+        snapshot = {'epoch': epoch, 'model': model.state_dict()}
+        try:
+            snapshot['optimizer'] = optimizer.state_dict()
+        except Exception:
+            snapshot['optimizer'] = None
+        torch.save(snapshot, snapshot_path)
+        print(f"Saved phase snapshot: {snapshot_path} (includes optimizer state if available)")
 
     model.train()
     # 在 head 和 layer4 阶段通常不更新 BN 的 running stats
@@ -227,10 +312,16 @@ for epoch in range(num_epochs):
           f"Train Acc={train_acc:.2f}%, Val Acc={val_acc:.2f}%, Val Top-3 Acc={val_top3_acc:.2f}%, "
           f"Loss={running_loss/len(train_loader):.4f}")
 
-    # 保存最佳模型
+    # 保存最佳模型（完整 checkpoint：包含 epoch、model、optimizer）
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(model.state_dict(), "best_classifier.pth")
-        print(f"  → 新最佳模型保存, Val Acc={val_acc:.2f}%")
+        best_path = "best_classifier.pth"
+        ckpt = {'epoch': epoch, 'model': model.state_dict()}
+        try:
+            ckpt['optimizer'] = optimizer.state_dict()
+        except Exception:
+            ckpt['optimizer'] = None
+        torch.save(ckpt, best_path)
+        print(f"  → 新最佳模型保存 (完整 checkpoint): {best_path}, Val Acc={val_acc:.2f}%")
 
 print("训练完成，最佳模型已保存: best_classifier.pth")
