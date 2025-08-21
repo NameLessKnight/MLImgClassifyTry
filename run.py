@@ -28,7 +28,19 @@ model.fc = torch.nn.Sequential(
     torch.nn.Dropout(0.3),
     torch.nn.Linear(num_features, len(classes))
 )
-model.load_state_dict(torch.load("best_classifier.pth", map_location=device))
+try:
+    ckpt = torch.load("best_classifier.pth", map_location=device)
+    # ckpt may be either a raw state_dict or a dict containing 'model' + other keys
+    if isinstance(ckpt, dict) and 'model' in ckpt:
+        state_dict = ckpt['model']
+    else:
+        state_dict = ckpt
+    model.load_state_dict(state_dict)
+    print("Loaded weights from best_classifier.pth")
+except FileNotFoundError:
+    print("Weight file best_classifier.pth not found. Proceeding without weights.")
+except Exception as e:
+    print(f"Warning: failed to load weights from best_classifier.pth: {e}")
 model = model.to(device)
 model.eval()
 
