@@ -11,9 +11,11 @@ import torch.nn.functional as F
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 data_dir = "dataset"
 batch_size = 32
-num_epochs = 15
+num_epochs = 7  # reduced to mitigate overfitting
 learning_rate = 1e-4
 weight_decay = 1e-4
+# Early stopping to prevent overfitting
+early_stopping_patience = 3
 log_interval = 10  # 每多少 batch 打印一次训练日志
 
 # ---------------------------
@@ -55,23 +57,23 @@ model = model.to(device)
 
 # 检查点加载（恢复训练）
 def resume_from_checkpoint(path, model, device):
-        """
-        尝试从 checkpoint 恢复模型并返回 (loaded_epoch, loaded_optimizer_state)。
+    """
+    尝试从 checkpoint 恢复模型并返回 (loaded_epoch, loaded_optimizer_state)。
 
-        支持两种格式：
-        1) 完整 checkpoint（字典，包含 'epoch','model','optimizer'），这是推荐格式；
-        2) 旧的仅包含 model.state_dict() 的格式（兼容加载）。
+    支持两种格式：
+    1) 完整 checkpoint（字典，包含 'epoch','model','optimizer'），这是推荐格式；
+    2) 旧的仅包含 model.state_dict() 的格式（兼容加载）。
 
-        如果加载失败，函数会打印警告并返回 (None, None)。
+    如果加载失败，函数会打印警告并返回 (None, None)。
 
-        参数：
-            - path: checkpoint 文件路径
-            - model: 要加载权重的模型实例（会就地修改）
-            - device: 加载到的设备（cpu 或 cuda）
+    参数：
+        - path: checkpoint 文件路径
+        - model: 要加载权重的模型实例（会就地修改）
+        - device: 加载到的设备（cpu 或 cuda）
 
-        返回：
-            (loaded_epoch, loaded_optimizer_state) 或 (None, None)
-        """
+    返回：
+        (loaded_epoch, loaded_optimizer_state) 或 (None, None)
+    """
     if not os.path.exists(path):
         print(f"Checkpoint '{path}' not found. Training from scratch.")
         return None, None
@@ -228,6 +230,7 @@ criterion = nn.CrossEntropyLoss()
 # 训练循环 + 验证集评估 + Top-3 + 保存最佳模型
 # ---------------------------
 best_val_acc = 0.0
+epochs_no_improve = 0
 
 for epoch in range(start_epoch, num_epochs):
     # 每个 epoch 开始时检查阶段是否变化；若变化则更新可训练参数并重建 optimizer，保存阶段快照
@@ -323,5 +326,13 @@ for epoch in range(start_epoch, num_epochs):
             ckpt['optimizer'] = None
         torch.save(ckpt, best_path)
         print(f"  → 新最佳模型保存 (完整 checkpoint): {best_path}, Val Acc={val_acc:.2f}%")
+        epochs_no_improve = 0
+    else:
+        epochs_no_improve += 1
+
+    # 早停检查
+    if epochs_no_improve >= early_stopping_patience:
+        print(f"Early stopping: 验证集在过去 {early_stopping_patience} 个 epoch 没有提升 (best {best_val_acc:.2f}%). 停止训练。")
+        break
 
 print("训练完成，最佳模型已保存: best_classifier.pth")
