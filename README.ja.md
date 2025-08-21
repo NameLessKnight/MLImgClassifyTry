@@ -46,11 +46,8 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 CUDA の例：
 ```powershell
-# CUDA 11.8
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# CUDA 12.1
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.9
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
 ```
 
 インストール後、PyTorch と CUDA の確認：
